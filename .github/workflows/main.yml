@@ -13,63 +13,56 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
-env:
-  JAVA_VERSION: '17'
-  KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
-  KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
-  KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-  KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
-
 jobs:
-  # ---------- 1. 识别项目类型 ----------
-  detect:
+  build:
     runs-on: ubuntu-latest
-    outputs:
-      type: ${{ steps.detect.outputs.type }}
+    timeout-minutes: 60
+    env:
+      # 使用 runner 预装的 Android SDK，不再调用 setup-android
+      ANDROID_HOME: /usr/local/lib/android/sdk
+      ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+      KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Detect project type
         id: detect
         run: |
-          echo "### 仓库顶层文件" >> $GITHUB_STEP_SUMMARY
+          if [ -f pubspec.yaml ]; then
+            echo "type=flutter" >> $GITHUB_OUTPUT
+          elif [ -f gradlew ] || [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
+            echo "type=android" >> $GITHUB_OUTPUT
+          elif grep -qs '"react-native"' package.json; then
+            echo "type=react-native" >> $GITHUB_OUTPUT
+          else
+            echo "type=unknown" >> $GITHUB_OUTPUT
+          fi
+          echo "### 仓库根目录" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
           ls -A >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
-          if [ -f pubspec.yaml ]; then
-            echo "type=flutter" >> $GITHUB_OUTPUT
-          elif [ -x gradlew ] || [ -f gradlew ] || [ -f settings.gradle ] || [ -f settings.gradle.kts ]; then
-            echo "type=android" >> $GITHUB_OUTPUT
-          elif grep -qs '"react-native"' package.json; then
-            echo "type=react-native" >> $GITHUB_OUTPUT
-          elif [ -f package.json ]; then
-            echo "type=node" >> $GITHUB_OUTPUT
-          else
-            echo "type=unknown" >> $GITHUB_OUTPUT
-          fi
-
-  # ---------- 2. 构建 ----------
-  build:
-    needs: detect
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up JDK ${{ env.JAVA_VERSION }}
-        if: needs.detect.outputs.type != 'node' && needs.detect.outputs.type != 'unknown'
+      - name: Set up JDK 17
+        if: steps.detect.outputs.type != 'unknown'
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: ${{ env.JAVA_VERSION }}
+          java-version: '17'
 
-      - name: Set up Android SDK
-        if: needs.detect.outputs.type != 'node' && needs.detect.outputs.type != 'unknown'
-        uses: android-actions/setup-android@v3
+      - name: Verify Android SDK (预装)
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'react-native'
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls "$ANDROID_HOME"
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
 
       - name: Cache Gradle
-        if: needs.detect.outputs.type == 'android' || needs.detect.outputs.type == 'react-native'
+        if: steps.detect.outputs.type == 'android' || steps.detect.outputs.type == 'react-native'
         uses: actions/cache@v4
         with:
           path: |
@@ -78,54 +71,52 @@ jobs:
           key: gradle-${{ runner.os }}-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
           restore-keys: gradle-${{ runner.os }}-
 
-      # ---- 原生 Gradle 项目 ----
+      # ---------- 原生 Gradle 项目 ----------
       - name: Build (Gradle)
-        if: needs.detect.outputs.type == 'android'
+        if: steps.detect.outputs.type == 'android'
         run: |
-          chmod +x gradlew
-          ./gradlew assembleDebug --stacktrace --no-daemon $( \
-            [ -n "$KEYSTORE_BASE64" ] && \
-            echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/ks.jks" && \
-            echo "-Pandroid.injected.signing.store.file=$RUNNER_TEMP/ks.jks \
-                  -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
-                  -Pandroid.injected.signing.key.alias=$KEY_ALIAS \
-                  -Pandroid.injected.signing.key.password=$KEY_PASSWORD" )
+          GRADLE=./gradlew
+          [ -f ./gradlew ] || GRADLE=gradle
+          [ -f ./gradlew ] && chmod +x ./gradlew
+          $GRADLE --version
+          $GRADLE assembleDebug --stacktrace --no-daemon
 
-      # ---- Flutter 项目 ----
+      # ---------- Flutter ----------
       - name: Set up Flutter
-        if: needs.detect.outputs.type == 'flutter'
+        if: steps.detect.outputs.type == 'flutter'
         uses: subosito/flutter-action@v2
         with:
           channel: stable
           cache: true
 
       - name: Build (Flutter)
-        if: needs.detect.outputs.type == 'flutter'
+        if: steps.detect.outputs.type == 'flutter'
         run: |
           flutter pub get
           flutter build apk --release
 
-      # ---- React Native 项目 ----
+      # ---------- React Native ----------
       - name: Set up Node
-        if: needs.detect.outputs.type == 'react-native'
+        if: steps.detect.outputs.type == 'react-native'
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: npm
 
       - name: Build (React Native)
-        if: needs.detect.outputs.type == 'react-native'
+        if: steps.detect.outputs.type == 'react-native'
         run: |
           npm ci || npm install
-          cd android && chmod +x gradlew && ./gradlew assembleRelease --stacktrace --no-daemon
+          cd android
+          chmod +x gradlew
+          ./gradlew assembleRelease --stacktrace --no-daemon
 
       - name: Unsupported project
-        if: needs.detect.outputs.type == 'node' || needs.detect.outputs.type == 'unknown'
+        if: steps.detect.outputs.type == 'unknown'
         run: |
-          echo "::error::没有识别到安卓项目结构（无 gradlew / pubspec.yaml / react-native）。请把仓库文件列表发给我。"
+          echo "::error::没识别到安卓项目结构，请看 Summary 里的根目录文件列表"
           exit 1
 
-      # ---------- 3. 收集并上传 APK ----------
+      # ---------- 收集 + 上传 APK ----------
       - name: Collect APKs
         run: |
           mkdir -p out
@@ -135,7 +126,7 @@ jobs:
             cp "$f" "out/$(basename "$f" .apk)-${GITHUB_SHA::7}.apk"
           done
           ls -lh out
-          test -n "$(ls -A out)" || { echo "::error::构建成功但没找到 APK"; exit 1; }
+          test -n "$(ls -A out)" || { echo "::error::构建成功但没有找到 APK"; exit 1; }
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
